@@ -2,6 +2,7 @@ import torch, torchvision
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 import os
+import numpy as np
 import pandas as pd
 from PIL import Image
 
@@ -26,6 +27,10 @@ class ISIC2019Dataset(Dataset):
     def __getitem__(self, idx):
         img_name = self.img_names[idx]
         label = self.labels[idx]
+        # 单类别 one-hot：每行恰好一个 1，避免多标签/异常行导致 argmax 静默错误
+        assert np.isclose(label.sum(), 1.0) and (np.isclose(label, 1.0).sum() == 1), (
+            f'样本 {idx} 标签非单类别 one-hot（sum={label.sum()}, 非零数={(label > 0.5).sum()}）'
+        )
         img_path = os.path.join(self.img_dir, img_name)
         img = Image.open(img_path).convert('RGB')
         if self.transform:
