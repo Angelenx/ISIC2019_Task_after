@@ -115,9 +115,9 @@ def get_args():
     # ---------- 模型与训练超参 ----------
     parser.add_argument('--num_classes', type=int, default=8, help='类别数（ISIC2019 为 8）')
     parser.add_argument('--epochs', type=int, default=80, help='训练轮数')
-    parser.add_argument('--batch_size', type=int, default=26, help='批大小')
+    parser.add_argument('--batch_size', type=int, default=20, help='批大小')
     parser.add_argument('--lr', type=float, default=1e-4, help='学习率')
-    parser.add_argument('--num_workers', type=int, default=2, help='DataLoader 子进程数')
+    parser.add_argument('--num_workers', type=int, default=4, help='DataLoader 子进程数')
     parser.add_argument('--save_dir', type=str, default='./checkpoints', help='模型、日志与曲线图保存目录')
     parser.add_argument('--log_interval', type=int, default=50, help='每多少个 batch 打印一次当前训练 loss')
     parser.add_argument('--gpu_temp_threshold', type=int, default=85, help='GPU 温度阈值（°C），超过则暂停冷却；0 表示不监测')
@@ -146,6 +146,28 @@ def get_args():
 def _args_to_dict(args):
     """将 args 转为可 JSON 序列化的 dict（仅基本类型），便于保存 config 复现实验。"""
     return {k: v for k, v in vars(args).items() if isinstance(v, (int, float, str, bool, type(None)))}
+
+
+def _args_to_command(args):
+    """
+    根据当前 args 生成完整可执行命令（含全部参数），写入日志后可直接复制复现。
+    布尔型：True 时输出 --xxx，False 时不输出；含空格的字符串值自动加引号。
+    """
+    parts = ['python', 'train.py']
+    for k, v in vars(args).items():
+        if not isinstance(v, (int, float, str, bool, type(None))):
+            continue
+        if v is None or v == '':
+            continue
+        if isinstance(v, bool):
+            if v:
+                parts.append(f'--{k}')
+        else:
+            s = str(v)
+            if ' ' in s or '\n' in s:
+                s = f'"{s}"'
+            parts.append(f'--{k} {s}')
+    return ' '.join(parts)
 
 
 def get_transforms(img_size, is_train=True):
@@ -628,7 +650,7 @@ def main():
             print(f'警告: --resume 指定路径不存在或不是文件，将从头训练: {args.resume}')
         with open(log_path, 'w', encoding='utf-8') as f:
             f.write(f'Start: {datetime.now().isoformat()}\n')
-            f.write(f'Command: {" ".join(sys.argv)}\n')
+            f.write(f'Command: {_args_to_command(args)}\n')
             f.write(f'Dataset sizes: train={n_train} val={n_val} test={n_test}\n')
             f.write(f'Args: {args}\n\n')
 

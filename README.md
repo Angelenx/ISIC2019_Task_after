@@ -113,7 +113,7 @@ python train.py --resume ./checkpoints/last_model.pth --save_dir ./checkpoints
 python train.py --seed 42 --deterministic --save_dir ./exp_repro
 ```
 
-同一 `seed` + `--deterministic`，再配合 `save_dir` 下的 `config.json` 与 `train_log.txt` 中的完整 Command，可尽量复现同一次实验。
+复现时建议配合 **config.json** 与 **train_log.txt** 中的完整 Command 使用，详见下文「如何使用 config.json 进行复现」。
 
 ### 6. 其他常用参数
 
@@ -137,7 +137,7 @@ python train.py --seed 42 --deterministic --save_dir ./exp_repro
 
 | 文件 | 说明 |
 |------|------|
-| **config.json** | 本次运行的全部参数（可 JSON 反序列化），便于复现与写方法 |
+| **config.json** | 本次运行的全部参数（键名对应命令行 `--xxx`），用于按相同配置复现，详见下文 |
 | **train_log.txt** | 训练日志：完整命令行、数据量、每轮 train/val 指标、测试集指标、每类 P/R/F1 |
 | **best_model.pth** | 验证集 Balanced Accuracy 最高的模型（用于最终测试评估与混淆矩阵） |
 | **last_model.pth** | 最后一轮模型，可用于 `--resume` 继续训练 |
@@ -148,6 +148,58 @@ python train.py --seed 42 --deterministic --save_dir ./exp_repro
 | **test_metrics_per_class.csv** | 测试集每类 precision、recall、f1、support |
 
 训练结束后（或 Ctrl+C 后），会用 **best 模型**在测试集上算一次指标并生成混淆矩阵与上述 CSV。
+
+---
+
+## 如何使用 config.json 进行复现
+
+每次训练开始时，脚本会在 `save_dir` 下生成 **config.json**，记录该次运行的全部参数（如 `img_dir`、`csv_path`、`seed`、`epochs`、`batch_size` 等）。复现时按下面步骤即可用同一套配置再跑一遍。
+
+### 1. 查看 config.json 内容
+
+`config.json` 是标准 JSON，键名与命令行参数一一对应（去掉 `--`，如 `--img_dir` → `img_dir`）。例如：
+
+```json
+{
+  "img_dir": "D:\\...\\ISIC_2019_Training_Input",
+  "csv_path": "D:\\...\\ISIC_2019_Training_GroundTruth.csv",
+  "test_img_dir": "D:\\...\\ISIC_2019_Test_Input",
+  "test_csv_path": "D:\\...\\ISIC_2019_Test_GroundTruth_without_unk.csv",
+  "seed": 1688,
+  "stratify_seed": 1688,
+  "epochs": 80,
+  "batch_size": 26,
+  "lr": 0.0001,
+  "val_ratio": 0.2,
+  "deterministic": false,
+  ...
+}
+```
+
+### 2. 按 config 重新拼出命令
+
+打开要复现的那次实验的 `config.json`，把需要复现的项写成命令行参数（布尔型：`true` 对应加 `--no_pretrained` 或 `--deterministic`，`false` 对应不加）。例如根据上面片段可得到：
+
+```bash
+python train.py --img_dir "D:\...\ISIC_2019_Training_Input" \
+               --csv_path "D:\...\ISIC_2019_Training_GroundTruth.csv" \
+               --test_img_dir "D:\...\ISIC_2019_Test_Input" \
+               --test_csv_path "D:\...\ISIC_2019_Test_GroundTruth_without_unk.csv" \
+               --seed 1688 --stratify_seed 1688 \
+               --epochs 80 --batch_size 26 --lr 0.0001 --val_ratio 0.2 \
+               --save_dir ./checkpoints_repro
+```
+
+若要**尽量完全复现**（同一机器、同一数据），建议加上 `--deterministic`，并把 `save_dir` 换成一个新目录（如 `./checkpoints_repro`），避免覆盖原实验。
+
+### 3. 复现时要注意的几点
+
+- **数据与路径**：复现前确认数据未改、路径可访问；若路径变了，在命令里用新路径覆盖 `config.json` 里对应项即可。
+- **种子**：`seed` 和 `stratify_seed` 必须与要复现的实验一致，否则 train/val 划分和训练随机性会不同。
+- **确定性**：在论文或报告中若声明“可复现”，建议复现时加上 `--deterministic`（与当初跑出结果时一致）。
+- **完整命令**：`train_log.txt` 开头会有一行 `Command: ...`，那是当次实际执行的完整命令，可作为复现的最终参照；config.json 则方便你只改其中几项（如路径或 `save_dir`）再拼新命令。
+
+总结：**config.json = 该次实验的参数快照**；复现时按其中键值写出命令行再执行即可，必要时结合 `train_log.txt` 里的 Command 核对。
 
 ---
 
