@@ -3,6 +3,8 @@ ISIC 2019 训练脚本：EfficientNet-B3，Balanced Accuracy 评估，输出中�
 """
 import os
 import argparse
+import subprocess
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,6 +22,30 @@ from datetime import datetime
 
 from Mydataset import ISIC2019Dataset
 from models import build_efficientnet_b3
+
+
+def get_gpu_temperature_celsius():
+    """
+    读取当前 CUDA 显卡温度（°C）。依赖 nvidia-smi，非 NVIDIA 或不可用时返回 None。
+    """
+    if not torch.cuda.is_available():
+        return None
+    try:
+        device_id = torch.cuda.current_device()
+        out = subprocess.run(
+            [
+                'nvidia-smi', '-i', str(device_id),
+                '--query-gpu=temperature.gpu', '--format=csv,noheader,nounits',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return int(out.stdout.strip().split()[0])
+    except (FileNotFoundError, ValueError, IndexError, subprocess.TimeoutExpired):
+        pass
+    return None
 
 
 class FocalLoss(nn.Module):
@@ -70,18 +96,23 @@ def get_args():
     # 模型与训练超参
     parser.add_argument('--num_classes', type=int, default=8, help='类别数（ISIC2019 为 8）')
     parser.add_argument('--epochs', type=int, default=80, help='训练轮数')
-    parser.add_argument('--batch_size', type=int, default=24, help='批大小')
-    parser.add_argument('--lr', type=float, default=8e-4, help='学习率')
+    parser.add_argument('--batch_size', type=int, default=26, help='批大小')
+    parser.add_argument('--lr', type=float, default=1e-3, help='学习率')
     parser.add_argument('--num_workers', type=int, default=4, help='DataLoader 子进程数')
     parser.add_argument('--save_dir', type=str, default='./checkpoints', help='模型、日志与曲线图保存目录')
     parser.add_argument('--log_interval', type=int, default=50, help='每多少个 batch 打印一次当前训练 loss')
-    parser.add_argument('--pretrained', action='store_true', help='使用 ImageNet 预训练权重；默认不使用预训练')
+    parser.add_argument('--gpu_temp_threshold', type=int, default=85, help='GPU 温度阈值（°C），超过则暂停冷却；0 表示不监测')
+    parser.add_argument('--gpu_temp_cooldown', type=int, default=60, help='过热时暂停冷却秒数')
+    parser.add_argument('--no_pretrained', action='store_true', help='不使用 ImageNet 预训练；默认使用预训练（ISIC 数据规模下建议开启）')
     parser.add_argument('--img_size', type=int, default=300, help='输入图像边长（EfficientNet-B3 常用 300）')
     # 数据划分（竞赛规范：训练/验证从训练集分层划分，测试集仅最终评估一次）
     parser.add_argument('--val_ratio', type=float, default=0.2, help='从训练集中划分出的验证集比例（stratified）')
-    parser.add_argument('--stratify_seed', type=int, default=42, help='train/val 分层划分的随机种子')
+    parser.add_argument('--stratify_seed', type=int, default=1688, help='train/val 分层划分的随机种子')
     # Focal Loss（类别不均衡）
     parser.add_argument('--focal_gamma', type=float, default=2.0, help='Focal Loss 的 gamma，越大越关注难分样本')
+    # 可复现性
+    parser.add_argument('--seed', type=int, default=1688, help='全局随机种子（torch/numpy/cuda）')
+    parser.add_argument('--deterministic', action='store_true', help='开启后 cudnn 确定性模式，可完全复现但可能更慢')
     # 继续训练
     parser.add_argument('--resume', type=str, default='',
                         help='从指定 checkpoint 继续训练，如 checkpoints/last_model.pth；留空则从头训练')
@@ -96,21 +127,23 @@ def get_args():
 def get_transforms(img_size, is_train=True):
     """
     根据训练/验证阶段返回数据增强与归一化。
-    训练时增加随机翻转；归一化使用 ImageNet 均值和标准差。
+    训练：RandomResizedCrop 保持比例并做尺度变化，避免强制拉伸导致病灶形变。
+    验证/测试：Resize 短边后 CenterCrop 成正方形，保持比例。
     """
-    # ImageNet 标准化，与预训练权重一致
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     if is_train:
         return transforms.Compose([
-            transforms.Resize((img_size, img_size)),
+            transforms.RandomResizedCrop(img_size, scale=(0.8, 1.0), ratio=(0.9, 1.1)),
             transforms.RandomHorizontalFlip(),
             transforms.RandomVerticalFlip(),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
             transforms.ToTensor(),
             normalize,
         ])
-    # 验证阶段不做随机增强
+    # 验证/测试：先按短边缩放到 img_size 再中心裁成正方形，避免拉伸
     return transforms.Compose([
-        transforms.Resize((img_size, img_size)),
+        transforms.Resize(img_size),
+        transforms.CenterCrop(img_size),
         transforms.ToTensor(),
         normalize,
     ])
@@ -124,9 +157,11 @@ def onehot_to_class(labels):
     return labels.argmax(dim=1).long()
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device, epoch, log_interval):
+def train_one_epoch(model, loader, criterion, optimizer, device, epoch, log_interval,
+                    gpu_temp_threshold=0, gpu_temp_cooldown=60):
     """
     训练一个 epoch：前向、反向、更新参数，并计算该 epoch 平均 loss 与 Balanced Accuracy。
+    每 log_interval 个 batch 检查一次 GPU 温度，超过 gpu_temp_threshold（°C）则暂停冷却。
     """
     if len(loader) == 0:
         return 0.0, 0.0
@@ -151,10 +186,20 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, log_inte
         all_preds.append(preds)
         all_labels.append(labels_idx.cpu().numpy())
 
-        # 按间隔打印当前平均 loss
+        # 按间隔打印当前平均 loss，并检查 GPU 温度
         if (i + 1) % log_interval == 0:
             avg_loss = running_loss / (i + 1)
             print(f'  [Epoch {epoch}] Batch {i+1}/{len(loader)}  Loss: {avg_loss:.4f}')
+            if gpu_temp_threshold > 0 and device.type == 'cuda':
+                temp = get_gpu_temperature_celsius()
+                if temp is not None:
+                    print(f'  GPU 温度: {temp}°C')
+                    if temp >= gpu_temp_threshold:
+                        print(f'  [过热保护] 达到阈值 {gpu_temp_threshold}°C，暂停 {gpu_temp_cooldown}s 冷却...')
+                        time.sleep(gpu_temp_cooldown)
+                        temp_after = get_gpu_temperature_celsius()
+                        if temp_after is not None:
+                            print(f'  冷却后 GPU 温度: {temp_after}°C')
 
     avg_loss = running_loss / len(loader)
     all_preds = np.concatenate(all_preds, axis=0)
@@ -340,7 +385,7 @@ def print_hyperparameters(args, device):
     print(f'    类别数:            {args.num_classes}')
     print(f'    输入尺寸:          {args.img_size} x {args.img_size}')
     print('  [模型]')
-    print(f'    是否使用预训练:    {"是" if args.pretrained else "否"}')
+    print(f'    是否使用预训练:    {"否" if args.no_pretrained else "是"}')
     print(f'    dropout:           0.3')
     print('  [训练]')
     print(f'    训练轮数:          {args.epochs}')
@@ -354,17 +399,32 @@ def print_hyperparameters(args, device):
     print(f'    val_ratio:         {getattr(args, "val_ratio", 0.2)}')
     print(f'    stratify_seed:     {getattr(args, "stratify_seed", 42)}')
     print(f'    focal_gamma:       {getattr(args, "focal_gamma", 2.0)}')
+    print(f'    seed:              {getattr(args, "seed", 42)}')
     print(f'    保存目录:          {args.save_dir}')
     print(f'    log_interval:      {args.log_interval}')
+    print(f'    gpu_temp_threshold: {getattr(args, "gpu_temp_threshold", 0)}°C (0=不监测)')
+    print(f'    gpu_temp_cooldown:  {getattr(args, "gpu_temp_cooldown", 60)}s')
     print(f'    num_workers:       {args.num_workers}')
     if getattr(args, 'resume', '') and args.resume:
         print(f'    继续训练 (resume):  {args.resume}')
     print('=' * 60 + '\n')
 
 
+def set_seed(seed, deterministic=False):
+    """设置全局随机种子，便于复现。"""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
 def main():
     """主流程：解析参数、构建数据与模型、训练、保存最佳/最新权重并绘制曲线。"""
     args = get_args()
+    set_seed(getattr(args, 'seed', 42), getattr(args, 'deterministic', False))
     os.makedirs(args.save_dir, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -422,6 +482,7 @@ def main():
         )
 
     # Focal Loss + 类别权重：与 Balanced Accuracy 一致，缓解类别不均衡并聚焦难分样本
+    # 若 train loss 震荡或 val recall 不稳，可尝试 alpha=1/sqrt(n)、focal_gamma=1.5
     train_class_indices = np.argmax(labels_full[train_idx], axis=1)
     class_counts = np.bincount(train_class_indices, minlength=args.num_classes)
     class_weights = 1.0 / (class_counts.astype(np.float64) + 1e-5)
@@ -430,7 +491,7 @@ def main():
 
     model = build_efficientnet_b3(
         num_classes=args.num_classes,
-        pretrained=args.pretrained,
+        pretrained=not args.no_pretrained,
         dropout=0.3,
     ).to(device)
 
@@ -496,7 +557,9 @@ def main():
         for epoch in range(start_epoch, args.epochs + 1):
             print(f'\n========== Epoch {epoch}/{args.epochs} ==========')
             train_loss, train_bal_acc = train_one_epoch(
-                model, train_loader, criterion, optimizer, device, epoch, args.log_interval
+                model, train_loader, criterion, optimizer, device, epoch, args.log_interval,
+                gpu_temp_threshold=getattr(args, 'gpu_temp_threshold', 0),
+                gpu_temp_cooldown=getattr(args, 'gpu_temp_cooldown', 60),
             )
             val_loss, val_bal_acc = evaluate(model, val_loader, criterion, device)
             # 先取当前 epoch 使用的学习率再 step，这样打印的 LR 与本期训练一致
