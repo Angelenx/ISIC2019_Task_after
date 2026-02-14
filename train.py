@@ -500,6 +500,14 @@ def _worker_init_fn(worker_id, base_seed=0):
     np.random.seed(base_seed + worker_id)
 
 
+class _SeedWorkerInit:
+    """可 pickle 的 worker 初始化器（Windows spawn 下 DataLoader 需可序列化）。"""
+    def __init__(self, seed):
+        self.seed = seed
+    def __call__(self, worker_id):
+        _worker_init_fn(worker_id, self.seed)
+
+
 def main():
     """
     主流程：解析参数 → 设置种子与设备 → 构建数据与模型 → 训练循环 →
@@ -554,7 +562,7 @@ def main():
         pin_memory=True,
         drop_last=False,
         generator=train_generator,
-        worker_init_fn=lambda wid: _worker_init_fn(wid, args.seed),
+        worker_init_fn=_SeedWorkerInit(args.seed),
     )
     val_loader = DataLoader(
         val_dataset,
