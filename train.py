@@ -300,6 +300,9 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, log_inte
         labels_onehot = labels.to(device)
         labels_idx = onehot_to_class(labels_onehot)
 
+        if i == 1:
+            print('[提示] 数据加载完成，现在应该可以安全使用 Ctrl+C 中断。')
+
         optimizer.zero_grad()
         logits = model(images)
         loss = criterion(logits, labels_idx)
@@ -311,7 +314,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, log_inte
         preds = logits.argmax(dim=1).detach().cpu().numpy()
         all_preds.append(preds)
         all_labels.append(labels_idx.cpu().numpy())
-
+        
         # 按间隔打印当前平均 loss，并可选地检查 GPU 温度与过热冷却
         if (i + 1) % log_interval == 0:
             avg_loss = running_loss / (i + 1)
@@ -785,16 +788,21 @@ def main():
     try:
         early_patience = getattr(args, 'early_stopping_patience', 0)
         epochs_without_improvement = 0
+        print('\n[提示] 仅在训练批次进度（如 [Epoch 1] Batch 100/1014  Loss: ...）输出时可安全使用 Ctrl+C；'
+              '每轮验证/测试及每轮开始时加载数据时请勿中断，否则可能出错。\n')
         # 训练循环：每轮 train → evaluate → 记录 history → 若 val 更优则存 best，每轮存 last
         for epoch in range(start_epoch, args.epochs + 1):
             print(f'\n========== Epoch {epoch}/{args.epochs} ==========')
+            print('[提示] 加载数据集中，现在暂不可使用Ctrl+C中断，请等待数据加载完成。')
             train_loss, train_bal_acc = train_one_epoch(
                 model, train_loader, criterion, optimizer, device, epoch, args.log_interval,
                 gpu_temp_threshold=args.gpu_temp_threshold,
                 gpu_temp_cooldown=args.gpu_temp_cooldown,
             )
+            print('[提示] 正在验证，请勿使用 Ctrl+C 中断。')
             val_loss, val_bal_acc = evaluate(model, val_loader, criterion, device)
             # 每轮在测试集上评估一次（仅记录曲线，不参与选 best；best 仍由 val 决定）
+            print('[提示] 正在测试集评估，请勿使用 Ctrl+C 中断。')
             test_loss, test_bal_acc = evaluate(model, test_loader, criterion, device)
             lr_now = scheduler.get_last_lr()[0]  # 先取 LR 再 step，打印与本期训练一致
             scheduler.step()
