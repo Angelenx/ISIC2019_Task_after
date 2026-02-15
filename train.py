@@ -118,7 +118,7 @@ def get_args():
     parser.add_argument('--epochs', type=int, default=80, help='训练轮数')
     parser.add_argument('--batch_size', type=int, default=20, help='批大小')
     parser.add_argument('--lr', type=float, default=3e-4, help='学习率（推荐 3e-4，EfficientNet+AdamW）')
-    parser.add_argument('--weight_decay', type=float, default=1e-4, help='AdamW 权重衰减（推荐 1e-4，过大影响 fine-tune）')
+    parser.add_argument('--weight_decay', type=float, default=5e-4, help='AdamW 权重衰减（5e-4/1e-3 可减轻过拟合；过大影响 fine-tune）')
     parser.add_argument('--num_workers', type=int, default=4, help='DataLoader 子进程数')
     parser.add_argument('--save_dir', type=str, default='./checkpoints', help='模型、日志与曲线图保存目录')
     parser.add_argument('--log_interval', type=int, default=50, help='每多少个 batch 打印一次当前训练 loss')
@@ -132,7 +132,7 @@ def get_args():
     # ---------- 损失函数（推荐 CE+class_weight+label_smoothing，Focal 易与 class weight 叠加过度） ----------
     parser.add_argument('--use_focal', action='store_true', help='使用 Focal Loss；默认用 CrossEntropyLoss+class_weight+label_smoothing')
     parser.add_argument('--label_smoothing', type=float, default=0.1, help='CE 的 label smoothing（医学图像常 0.1）')
-    parser.add_argument('--focal_gamma', type=float, default=2.0, help='Focal Loss 的 gamma（仅 --use_focal 时生效）')
+    parser.add_argument('--focal_gamma', type=float, default=2.0, help='Focal Loss 的 gamma（仅 --use_focal 时生效；极度不均衡可试 3.0～5.0）')
     # ---------- Early stopping ----------
     parser.add_argument('--early_stopping_patience', type=int, default=0, help='验证集无提升则提前停止的 epoch 数，0 表示不启用（推荐 8）')
     # ---------- 可复现性 ----------
@@ -184,23 +184,23 @@ def _args_to_command(args):
 def get_transforms(img_size, is_train=True):
     """
     根据阶段返回数据增强与 ImageNet 归一化。
-    - 训练：RandomResizedCrop + 翻转 + ColorJitter + RandomRotation + RandomAffine，ISIC 背景变化大。
-    - 验证/测试：Resize 短边后 CenterCrop 成 img_size×img_size，无随机性。
+    - 训练：强增强以缓解过拟合（ISIC 光照/颜色差异大）：更大裁剪范围、45° 旋转、shear、强 ColorJitter（含 hue）。
+    - 验证/测试：先 Resize 再 CenterCrop，无随机性；先略放大再裁以保留中心区域。
     """
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     if is_train:
         return transforms.Compose([
-            transforms.RandomResizedCrop(img_size, scale=(0.8, 1.0), ratio=(0.9, 1.1)),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomVerticalFlip(),
-            transforms.RandomRotation(20),
-            transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1)),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+            transforms.RandomResizedCrop(img_size, scale=(0.6, 1.0), ratio=(0.8, 1.2)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.5),
+            transforms.RandomRotation(45),
+            transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), shear=5),
+            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
             transforms.ToTensor(),
             normalize,
         ])
     return transforms.Compose([
-        transforms.Resize(img_size),
+        transforms.Resize(int(img_size * 1.15)),
         transforms.CenterCrop(img_size),
         transforms.ToTensor(),
         normalize,

@@ -33,7 +33,7 @@ class ISIC2019Dataset(Dataset):
         return len(self.img_names)
 
     def __getitem__(self, idx):
-        img_name = self.img_names[idx]
+        img_name = self.img_names[idx]  # 已在 __init__ 中补足 .jpg，CSV 第一列应为无后缀文件名
         label = self.labels[idx]
         # 单标签 one-hot 断言：每行和为 1 且恰好一个 1，避免多标签/异常行导致 argmax 静默错误
         assert np.isclose(label.sum(), 1.0) and (np.isclose(label, 1.0).sum() == 1), (
