@@ -12,6 +12,7 @@ import os
 import sys
 import json
 import argparse
+import random
 import subprocess
 import time
 import torch
@@ -142,12 +143,17 @@ def get_args():
     # ---------- Early stopping ----------
     parser.add_argument('--early_stopping_patience', type=int, default=8, help='验证集无提升则提前停止的 epoch 数，0 表示不启用（推荐 8）')
     # ---------- 可复现性 ----------
-    parser.add_argument('--seed', type=int, default=1688, help='全局随机种子（torch/numpy/cuda）')
+    parser.add_argument('--seed', type=int, default=1688, help='训练/DataLoader/transform 等随机种子（torch/numpy/cuda）')
+    parser.add_argument('--global_seed', type=int, default=None, help='若指定则同时作为 seed 与 stratify_seed，单参数统一全部随机源；不指定则使用上述 seed 与 stratify_seed')
     parser.add_argument('--deterministic', action='store_true', help='开启后 cudnn 确定性模式，可完全复现但可能更慢')
     # ---------- 继续训练 ----------
     parser.add_argument('--resume', type=str, default='',
                         help='从指定 checkpoint 继续训练，如 checkpoints/last_model.pth；留空则从头训练')
     args = parser.parse_args()
+    # 若指定了 global_seed，则覆盖 seed 与 stratify_seed，保持与 config 兼容（config 会保存 global_seed 及生效后的 seed/stratify_seed）
+    if getattr(args, 'global_seed', None) is not None:
+        args.seed = args.global_seed
+        args.stratify_seed = args.global_seed
     # 避免无效值导致除零或空循环
     args.log_interval = max(1, int(args.log_interval))
     args.epochs = max(1, int(args.epochs))
@@ -521,11 +527,14 @@ def print_hyperparameters(args, device):
         ('其他', [
             ('val_ratio', args.val_ratio), ('stratify_seed', args.stratify_seed),
             ('focal_gamma', args.focal_gamma), ('seed', args.seed),
+            ('deterministic', '是' if getattr(args, 'deterministic', False) else '否'),
             ('保存目录', args.save_dir), ('log_interval', args.log_interval),
             ('gpu_temp_threshold', f'{args.gpu_temp_threshold}°C (0=不监测)'),
             ('gpu_temp_cooldown', f'{args.gpu_temp_cooldown}s'), ('num_workers', args.num_workers),
         ]),
     ]
+    if getattr(args, 'global_seed', None) is not None:
+        sections[-1][1].append(('global_seed (已覆盖 seed/stratify_seed)', args.global_seed))
     if args.resume:
         sections[-1][1].append(('继续训练 (resume)', args.resume))
     print('\n' + '=' * 60 + '\n  训练超参数\n' + '=' * 60)
@@ -551,8 +560,14 @@ def set_seed(seed, deterministic=False):
 
 
 def _worker_init_fn(worker_id, base_seed=0):
-    """DataLoader 子进程内设置 numpy 随机种子，便于多进程下可复现。"""
-    np.random.seed(base_seed + worker_id)
+    """
+    DataLoader 子进程内设置随机种子，使 transform（RandomCrop/Rotation/ColorJitter 等）可复现。
+    torchvision 使用 Python random 与 torch；需同时设置 random、np、torch 的种子。
+    """
+    seed = base_seed + worker_id
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
 
 class _SeedWorkerInit:
