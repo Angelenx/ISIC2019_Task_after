@@ -34,6 +34,12 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from datetime import datetime
 
+
+def _log_ts():
+    """当前时间戳，精确到秒，用于日志行前缀。格式如 [2026-02-15 12:41:30] """
+    return datetime.now().strftime('[%Y-%m-%d %H:%M:%S] ')
+
+
 from Mydataset import ISIC2019Dataset
 from models import build_efficientnet_b3
 
@@ -121,9 +127,9 @@ def get_args():
     parser.add_argument('--weight_decay', type=float, default=5e-4, help='AdamW 权重衰减（5e-4/1e-3 可减轻过拟合；过大影响 fine-tune）')
     parser.add_argument('--num_workers', type=int, default=4, help='DataLoader 子进程数')
     parser.add_argument('--save_dir', type=str, default='./checkpoints', help='模型、日志与曲线图保存目录')
-    parser.add_argument('--log_interval', type=int, default=50, help='每多少个 batch 打印一次当前训练 loss')
+    parser.add_argument('--log_interval', type=int, default=100, help='每多少个 batch 打印一次当前训练 loss')
     parser.add_argument('--gpu_temp_threshold', type=int, default=85, help='GPU 温度阈值（°C），超过则暂停冷却；0 表示不监测')
-    parser.add_argument('--gpu_temp_cooldown', type=int, default=60, help='过热时暂停冷却秒数')
+    parser.add_argument('--gpu_temp_cooldown', type=int, default=30, help='过热时暂停冷却秒数')
     parser.add_argument('--no_pretrained', action='store_true', help='不使用 ImageNet 预训练；默认使用预训练（ISIC 数据规模下建议开启）')
     parser.add_argument('--img_size', type=int, default=300, help='输入图像边长（EfficientNet-B3 常用 300）')
     # ---------- 数据划分（竞赛规范：train/val 从训练集 stratified 划分，test 仅最终评估一次） ----------
@@ -132,9 +138,9 @@ def get_args():
     # ---------- 损失函数（推荐 CE+class_weight+label_smoothing，Focal 易与 class weight 叠加过度） ----------
     parser.add_argument('--use_focal', action='store_true', help='使用 Focal Loss；默认用 CrossEntropyLoss+class_weight+label_smoothing')
     parser.add_argument('--label_smoothing', type=float, default=0.1, help='CE 的 label smoothing（医学图像常 0.1）')
-    parser.add_argument('--focal_gamma', type=float, default=2.0, help='Focal Loss 的 gamma（仅 --use_focal 时生效；极度不均衡可试 3.0～5.0）')
+    parser.add_argument('--focal_gamma', type=float, default=3.0, help='Focal Loss 的 gamma（仅 --use_focal 时生效；极度不均衡可试 3.0～5.0）')
     # ---------- Early stopping ----------
-    parser.add_argument('--early_stopping_patience', type=int, default=0, help='验证集无提升则提前停止的 epoch 数，0 表示不启用（推荐 8）')
+    parser.add_argument('--early_stopping_patience', type=int, default=8, help='验证集无提升则提前停止的 epoch 数，0 表示不启用（推荐 8）')
     # ---------- 可复现性 ----------
     parser.add_argument('--seed', type=int, default=1688, help='全局随机种子（torch/numpy/cuda）')
     parser.add_argument('--deterministic', action='store_true', help='开启后 cudnn 确定性模式，可完全复现但可能更慢')
@@ -434,8 +440,8 @@ def _run_final_test_eval(model, test_loader, criterion, device, save_dir, num_cl
         print(f'\n测试集  Loss: {test_loss:.4f}  BalancedAcc: {test_bal_acc:.4f}')
         print(f'  Macro  Precision: {macro_p:.4f}  Recall: {macro_r:.4f}  F1: {macro_f1:.4f}')
         with open(log_path, 'a', encoding='utf-8') as f:
-            f.write(f'Test Loss: {test_loss:.4f}  Test BalancedAcc: {test_bal_acc:.4f}\n')
-            f.write(f'Test Macro  P: {macro_p:.4f}  R: {macro_r:.4f}  F1: {macro_f1:.4f}\n')
+            f.write(_log_ts() + f'Test Loss: {test_loss:.4f}  Test BalancedAcc: {test_bal_acc:.4f}\n')
+            f.write(_log_ts() + f'Test Macro  P: {macro_p:.4f}  R: {macro_r:.4f}  F1: {macro_f1:.4f}\n')
         # 每类指标保存 CSV，便于论文表格
         metrics_path = os.path.join(save_dir, 'test_metrics_per_class.csv')
         metrics_df = pd.DataFrame({
@@ -682,22 +688,22 @@ def main():
         print(f'已从 checkpoint 恢复: {args.resume}')
         print(f'  上次训练到 Epoch {start_epoch - 1}，将从 Epoch {start_epoch} 继续至 {args.epochs}')
         with open(log_path, 'a', encoding='utf-8') as f:
-            f.write(f'\n[继续训练] {datetime.now().isoformat()} 从 {args.resume} 恢复，从 Epoch {start_epoch} 继续\n\n')
+            f.write(_log_ts() + f'\n[继续训练] 从 {args.resume} 恢复，从 Epoch {start_epoch} 继续\n\n')
     else:
         if args.resume:
             print(f'警告: --resume 指定路径不存在或不是文件，将从头训练: {args.resume}')
         with open(log_path, 'w', encoding='utf-8') as f:
-            f.write(f'Start: {datetime.now().isoformat()}\n')
-            f.write(f'Command: {_args_to_command(args)}\n')
-            f.write(f'Dataset sizes: train={n_train} val={n_val} test={n_test}\n')
-            f.write(f'Args: {args}\n\n')
+            f.write(_log_ts() + f'Start: {datetime.now().isoformat()}\n')
+            f.write(_log_ts() + f'Command: {_args_to_command(args)}\n')
+            f.write(_log_ts() + f'Dataset sizes: train={n_train} val={n_val} test={n_test}\n')
+            f.write(_log_ts() + f'Args: {args}\n\n')
 
     # 恢复后若已超过目标轮数：不再训练，仅写日志、画曲线、用 best 做测试集评估与混淆矩阵
     if start_epoch > args.epochs:
         print(f'当前已训练至 Epoch {start_epoch - 1}，不小于目标轮数 {args.epochs}，无需继续训练。')
         with open(log_path, 'a', encoding='utf-8') as f:
-            f.write(f'\nBest Val Balanced Accuracy: {best_bal_acc:.4f}\n')
-            f.write(f'End: {datetime.now().isoformat()}\n')
+            f.write(_log_ts() + f'\nBest Val Balanced Accuracy: {best_bal_acc:.4f}\n')
+            f.write(_log_ts() + f'End: {datetime.now().isoformat()}\n')
         if history.get('train_loss'):
             plot_curves(history, args.save_dir)
             _run_final_test_eval(
@@ -732,7 +738,7 @@ def main():
             )
             print(line.strip())
             with open(log_path, 'a', encoding='utf-8') as f:
-                f.write(line)
+                f.write(_log_ts() + line)
 
             # 用 float() 转成 Python 标量，避免 numpy 等类型进入 checkpoint
             history['train_loss'].append(float(train_loss))
@@ -764,13 +770,13 @@ def main():
             if early_patience > 0 and epochs_without_improvement >= early_patience:
                 print(f'\n[Early Stopping] 验证集 {early_patience} 轮无提升，停止训练。')
                 with open(log_path, 'a', encoding='utf-8') as f:
-                    f.write(f'\n[Early Stopping] Epoch {epoch} 验证集 {early_patience} 轮无提升\n')
+                    f.write(_log_ts() + f'\n[Early Stopping] Epoch {epoch} 验证集 {early_patience} 轮无提升\n')
                 break
 
         # 正常结束：写最佳指标与结束时间到日志
         with open(log_path, 'a', encoding='utf-8') as f:
-            f.write(f'\nBest Val Balanced Accuracy: {best_bal_acc:.4f}\n')
-            f.write(f'End: {datetime.now().isoformat()}\n')
+            f.write(_log_ts() + f'\nBest Val Balanced Accuracy: {best_bal_acc:.4f}\n')
+            f.write(_log_ts() + f'End: {datetime.now().isoformat()}\n')
         print(f'\n训练结束。最佳 Val Balanced Accuracy: {best_bal_acc:.4f}')
         print(f'日志: {log_path}')
 
@@ -778,8 +784,8 @@ def main():
         # Ctrl+C 中断：写日志、保存已有曲线、用 best 做测试集评估与混淆矩阵
         print('\n\n训练被用户中断 (Ctrl+C)。')
         with open(log_path, 'a', encoding='utf-8') as f:
-            f.write(f'\n[用户中断] {datetime.now().isoformat()}\n')
-            f.write(f'中断前最佳 Val Balanced Accuracy: {best_bal_acc:.4f}\n')
+            f.write(_log_ts() + f'\n[用户中断] {datetime.now().isoformat()}\n')
+            f.write(_log_ts() + f'中断前最佳 Val Balanced Accuracy: {best_bal_acc:.4f}\n')
         if history['train_loss']:
             print('正在保存已完成的训练曲线...')
             plot_curves(history, args.save_dir)
