@@ -1,6 +1,6 @@
 # ISIC 2019 皮肤病变分类训练脚本
 
-基于 **EfficientNet-B3** 的 ISIC 2019 八类皮肤病变分类训练脚本，面向竞赛规范与科研复现：Stratified 划分、Focal Loss、Balanced Accuracy、完整日志与可复现设置。
+基于 **EfficientNet-B3** 的 ISIC 2019 八类皮肤病变分类训练脚本，面向竞赛规范与科研复现：Stratified 划分、**CE + class_weight + label_smoothing**（推荐）、Balanced Accuracy、完整日志与可复现设置。
 
 ---
 
@@ -9,10 +9,14 @@
 | 项目 | 说明 |
 |------|------|
 | **模型** | EfficientNet-B3，默认 ImageNet 预训练，8 类分类头 |
-| **损失** | Focal Loss + 按训练集类别统计的权重，缓解类别不均衡 |
+| **损失** | 默认 **CrossEntropyLoss + class_weight + label_smoothing=0.1**；可选 `--use_focal` 用 Focal Loss |
+| **优化** | AdamW(lr=3e-4, weight_decay=1e-4)，CosineAnnealingLR；可选 early stopping |
 | **评估** | Balanced Accuracy；验证集选 best，测试集仅最终评估一次 |
-| **数据划分** | 训练集 Stratified 划分 train/val；测试集单独路径，无泄露 |
+| **数据划分** | 训练集 Stratified 划分 train/val；测试集单独路径，无泄露；增强含 RandomRotation/RandomAffine |
 | **输出** | 曲线图、混淆矩阵（PNG+CSV）、每类 P/R/F1、config 与完整命令行日志 |
+
+**快速开始**：准备好数据路径后，直接 `python train.py` 使用默认配置；或使用推荐配置  
+`python train.py --epochs 30 --early_stopping_patience 8 --batch_size 16 --save_dir ./checkpoints_strong`。
 
 ---
 
@@ -79,7 +83,7 @@ python train.py --img_dir /path/to/train/images \
                --save_dir ./my_checkpoints
 ```
 
-### 3. 常用参数示例
+### 3. 常用参数示例（默认 CE + 3e-4 lr + 1e-4 weight_decay）
 
 ```bash
 python train.py \
@@ -89,11 +93,20 @@ python train.py \
   --test_csv_path ./data/test_gt.csv \
   --save_dir ./checkpoints \
   --epochs 80 \
-  --batch_size 26 \
-  --lr 1e-4 \
+  --batch_size 20 \
+  --lr 3e-4 \
+  --weight_decay 1e-4 \
   --val_ratio 0.2 \
   --seed 1688
 ```
+
+### 3b. 推荐高性能配置（约 0.85+ Balanced Acc）
+
+```bash
+python train.py --epochs 30 --early_stopping_patience 8 --batch_size 16 --save_dir ./checkpoints_strong
+```
+
+其余默认：CE + class_weight + label_smoothing=0.1，lr=3e-4，weight_decay=1e-4。无需 `--use_focal`。
 
 ### 4. 继续训练（断点续训）
 
@@ -115,19 +128,40 @@ python train.py --seed 42 --deterministic --save_dir ./exp_repro
 
 复现时建议配合 **config.json** 与 **train_log.txt** 中的完整 Command 使用，详见下文「如何使用 config.json 进行复现」。
 
-### 6. 其他常用参数
+### 6. 参数一览
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
+| **数据** | | |
+| `--img_dir` | （见脚本） | 训练图像目录 |
+| `--csv_path` | （见脚本） | 训练标签 CSV |
+| `--test_img_dir` | （见脚本） | 测试集图像目录 |
+| `--test_csv_path` | （见脚本） | 测试集标签 CSV |
+| `--save_dir` | ./checkpoints | 模型、日志、曲线保存目录 |
+| **训练** | | |
+| `--epochs` | 80 | 训练轮数 |
+| `--batch_size` | 20 | 批大小 |
+| `--lr` | 3e-4 | 学习率（EfficientNet+AdamW 推荐） |
+| `--weight_decay` | 1e-4 | AdamW 权重衰减 |
+| `--use_focal` | 否 | 使用 Focal Loss；默认 CE+class_weight+label_smoothing |
+| `--label_smoothing` | 0.1 | CE 的 label smoothing |
+| `--focal_gamma` | 2.0 | Focal Loss 的 gamma（仅 --use_focal 时生效） |
+| `--early_stopping_patience` | 0 | 验证集无提升则提前停止的 epoch 数，0=不启用，推荐 8 |
+| **数据划分** | | |
+| `--val_ratio` | 0.2 | 验证集比例（stratified） |
+| `--stratify_seed` | 1688 | train/val 划分随机种子 |
+| **模型与输入** | | |
 | `--num_classes` | 8 | 类别数 |
-| `--img_size` | 300 | 输入边长（EfficientNet-B3 常用 300） |
-| `--no_pretrained` | 否 | 加上则不用 ImageNet 预训练 |
-| `--focal_gamma` | 2.0 | Focal Loss 的 gamma |
-| `--stratify_seed` | 1688 | train/val 分层划分的随机种子 |
-| `--num_workers` | 2 | DataLoader 子进程数 |
-| `--log_interval` | 50 | 每多少个 batch 打印一次训练 loss |
-| `--gpu_temp_threshold` | 85 | GPU 温度阈值（°C），0 表示不监测 |
-| `--gpu_temp_cooldown` | 60 | 过热时暂停冷却秒数 |
+| `--img_size` | 300 | 输入边长 |
+| `--no_pretrained` | 否 | 不加则使用 ImageNet 预训练 |
+| **其他** | | |
+| `--num_workers` | 4 | DataLoader 子进程数 |
+| `--log_interval` | 50 | 每多少 batch 打印一次 loss |
+| `--seed` | 1688 | 全局随机种子 |
+| `--deterministic` | 否 | 开启 cudnn 确定性以完全复现 |
+| `--resume` | 空 | 从指定 checkpoint 继续训练 |
+| `--gpu_temp_threshold` | 85 | GPU 温度阈值（°C），0=不监测 |
+| `--gpu_temp_cooldown` | 60 | 过热时暂停秒数 |
 
 ---
 
@@ -138,7 +172,7 @@ python train.py --seed 42 --deterministic --save_dir ./exp_repro
 | 文件 | 说明 |
 |------|------|
 | **config.json** | 本次运行的全部参数（键名对应命令行 `--xxx`），用于按相同配置复现，详见下文 |
-| **train_log.txt** | 训练日志：完整命令行、数据量、每轮 train/val 指标、测试集指标、每类 P/R/F1 |
+| **train_log.txt** | 训练日志：首行完整可执行命令（`Command: python train.py ...`）、数据量、每轮 train/val 指标、测试集指标、每类 P/R/F1 |
 | **best_model.pth** | 验证集 Balanced Accuracy 最高的模型（用于最终测试评估与混淆矩阵） |
 | **last_model.pth** | 最后一轮模型，可用于 `--resume` 继续训练 |
 | **loss_curve.png** | 训练/验证 Loss 曲线 |
@@ -168,9 +202,13 @@ python train.py --seed 42 --deterministic --save_dir ./exp_repro
   "seed": 1688,
   "stratify_seed": 1688,
   "epochs": 80,
-  "batch_size": 26,
-  "lr": 0.0001,
+  "batch_size": 20,
+  "lr": 0.0003,
+  "weight_decay": 0.0001,
   "val_ratio": 0.2,
+  "use_focal": false,
+  "label_smoothing": 0.1,
+  "early_stopping_patience": 0,
   "deterministic": false,
   ...
 }
@@ -178,7 +216,14 @@ python train.py --seed 42 --deterministic --save_dir ./exp_repro
 
 ### 2. 按 config 重新拼出命令
 
-打开要复现的那次实验的 `config.json`，把需要复现的项写成命令行参数（布尔型：`true` 对应加 `--no_pretrained` 或 `--deterministic`，`false` 对应不加）。例如根据上面片段可得到：
+**从 config.json 拼出命令的规则**（与 `train_log.txt` 中 `Command:` 行一致）：
+
+- **布尔**：`true` → 加 `--键名`（如 `--use_focal`、`--no_pretrained`、`--deterministic`）；`false` → 不加。
+- **空字符串 / null**：`resume` 为 `""` 或缺失时不加 `--resume`。
+- **数值与字符串**：`--键名 值`（路径等含空格时用引号包住值）。
+- **新增参数**：`use_focal`、`label_smoothing`、`weight_decay`、`early_stopping_patience` 等均在 config 中，按上规则写出即可。
+
+示例（根据上面 config 片段）：
 
 ```bash
 python train.py --img_dir "D:\...\ISIC_2019_Training_Input" \
@@ -186,9 +231,12 @@ python train.py --img_dir "D:\...\ISIC_2019_Training_Input" \
                --test_img_dir "D:\...\ISIC_2019_Test_Input" \
                --test_csv_path "D:\...\ISIC_2019_Test_GroundTruth_without_unk.csv" \
                --seed 1688 --stratify_seed 1688 \
-               --epochs 80 --batch_size 26 --lr 0.0001 --val_ratio 0.2 \
+               --epochs 80 --batch_size 20 --lr 0.0003 --weight_decay 0.0001 --val_ratio 0.2 \
+               --label_smoothing 0.1 --early_stopping_patience 0 \
                --save_dir ./checkpoints_repro
 ```
+
+（当 `use_focal`、`no_pretrained`、`deterministic` 为 `false` 时不出现在命令中；`resume` 为空时也不出现。）
 
 若要**尽量完全复现**（同一机器、同一数据），建议加上 `--deterministic`，并把 `save_dir` 换成一个新目录（如 `./checkpoints_repro`），避免覆盖原实验。
 
@@ -207,10 +255,10 @@ python train.py --img_dir "D:\...\ISIC_2019_Training_Input" \
 
 1. 解析参数 → 设置随机种子 → 创建 `save_dir`，写入 `config.json`。
 2. 按 `--stratify_seed` 对训练 CSV 做 **Stratified** 划分得到 train/val，测试集单独从 `test_img_dir` + `test_csv_path` 读取。
-3. 构建 EfficientNet-B3、Focal Loss（类别权重由训练子集统计）、AdamW、CosineAnnealingLR。
+3. 构建 EfficientNet-B3、损失（默认 CE + class_weight + label_smoothing；或 `--use_focal` 时 Focal Loss）、AdamW(lr=3e-4, weight_decay=1e-4)、CosineAnnealingLR。
 4. 若提供 `--resume` 且文件存在，则加载该 checkpoint 继续训练；否则从头训练。
-5. 每轮：训练 → 验证 → 记录 history → 若验证 Balanced Accuracy 创新高则保存 best，每轮保存 last。
-6. 正常结束或 Ctrl+C：绘制曲线 → 加载 best → 在测试集上评估 → 输出混淆矩阵（PNG+CSV）与每类 P/R/F1，并写入日志与 CSV。
+5. 每轮：训练 → 验证 → 记录 history → 若验证 Balanced Accuracy 创新高则保存 best，每轮保存 last；若启用 `--early_stopping_patience` 且连续若干轮无提升则提前停止。
+6. 正常结束、提前停止或 Ctrl+C：绘制曲线 → 加载 best → 在测试集上评估 → 输出混淆矩阵（PNG+CSV）与每类 P/R/F1，并写入日志与 CSV。日志开头含完整可执行命令（`Command: ...`）。
 
 ---
 

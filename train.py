@@ -2,9 +2,10 @@
 ISIC 2019 训练脚本（竞赛规范版，科研向）
 
 - 模型：EfficientNet-B3，可选 ImageNet 预训练
-- 损失：Focal Loss + 类别权重，缓解类别不均衡
+- 损失：默认 CrossEntropyLoss + class_weight + label_smoothing=0.1（推荐）；可选 --use_focal 用 Focal Loss
+- 优化：AdamW(lr=3e-4, weight_decay=1e-4)，CosineAnnealingLR；可选 early stopping
 - 评估：Balanced Accuracy；验证集选 best，测试集仅最终评估一次；输出每类 P/R/F1 与混淆矩阵 CSV
-- 数据：Stratified train/val，无 test 泄露；DataLoader 支持可复现 shuffle（generator + worker_init_fn）
+- 数据：Stratified train/val，无 test 泄露；增强含 RandomRotation/RandomAffine
 - 可复现：种子、可选 deterministic、保存 config.json 与完整命令行到日志
 """
 import os
@@ -116,7 +117,8 @@ def get_args():
     parser.add_argument('--num_classes', type=int, default=8, help='类别数（ISIC2019 为 8）')
     parser.add_argument('--epochs', type=int, default=80, help='训练轮数')
     parser.add_argument('--batch_size', type=int, default=20, help='批大小')
-    parser.add_argument('--lr', type=float, default=1e-4, help='学习率')
+    parser.add_argument('--lr', type=float, default=3e-4, help='学习率（推荐 3e-4，EfficientNet+AdamW）')
+    parser.add_argument('--weight_decay', type=float, default=1e-4, help='AdamW 权重衰减（推荐 1e-4，过大影响 fine-tune）')
     parser.add_argument('--num_workers', type=int, default=4, help='DataLoader 子进程数')
     parser.add_argument('--save_dir', type=str, default='./checkpoints', help='模型、日志与曲线图保存目录')
     parser.add_argument('--log_interval', type=int, default=50, help='每多少个 batch 打印一次当前训练 loss')
@@ -127,8 +129,12 @@ def get_args():
     # ---------- 数据划分（竞赛规范：train/val 从训练集 stratified 划分，test 仅最终评估一次） ----------
     parser.add_argument('--val_ratio', type=float, default=0.2, help='从训练集中划分出的验证集比例（stratified）')
     parser.add_argument('--stratify_seed', type=int, default=1688, help='train/val 分层划分的随机种子')
-    # ---------- Focal Loss（类别不均衡） ----------
-    parser.add_argument('--focal_gamma', type=float, default=2.0, help='Focal Loss 的 gamma，越大越关注难分样本')
+    # ---------- 损失函数（推荐 CE+class_weight+label_smoothing，Focal 易与 class weight 叠加过度） ----------
+    parser.add_argument('--use_focal', action='store_true', help='使用 Focal Loss；默认用 CrossEntropyLoss+class_weight+label_smoothing')
+    parser.add_argument('--label_smoothing', type=float, default=0.1, help='CE 的 label smoothing（医学图像常 0.1）')
+    parser.add_argument('--focal_gamma', type=float, default=2.0, help='Focal Loss 的 gamma（仅 --use_focal 时生效）')
+    # ---------- Early stopping ----------
+    parser.add_argument('--early_stopping_patience', type=int, default=0, help='验证集无提升则提前停止的 epoch 数，0 表示不启用（推荐 8）')
     # ---------- 可复现性 ----------
     parser.add_argument('--seed', type=int, default=1688, help='全局随机种子（torch/numpy/cuda）')
     parser.add_argument('--deterministic', action='store_true', help='开启后 cudnn 确定性模式，可完全复现但可能更慢')
@@ -144,14 +150,19 @@ def get_args():
 
 
 def _args_to_dict(args):
-    """将 args 转为可 JSON 序列化的 dict（仅基本类型），便于保存 config 复现实验。"""
+    """
+    将 args 转为可 JSON 序列化的 dict（仅 int/float/str/bool/None），便于保存 config.json 复现实验。
+    所有通过 argparse 定义的参数（含 use_focal、label_smoothing、weight_decay、early_stopping_patience 等）
+    只要值为基本类型都会写入，无需单独维护字段列表。
+    """
     return {k: v for k, v in vars(args).items() if isinstance(v, (int, float, str, bool, type(None)))}
 
 
 def _args_to_command(args):
     """
     根据当前 args 生成完整可执行命令（含全部参数），写入日志后可直接复制复现。
-    布尔型：True 时输出 --xxx，False 时不输出；含空格的字符串值自动加引号。
+    规则：布尔 True → --key，False 不输出；空字符串 / None 不输出；其余 --key value；含空格的值加引号。
+    与 config.json 一致：config 中有的键都可按此规则还原为命令行。
     """
     parts = ['python', 'train.py']
     for k, v in vars(args).items():
@@ -173,7 +184,7 @@ def _args_to_command(args):
 def get_transforms(img_size, is_train=True):
     """
     根据阶段返回数据增强与 ImageNet 归一化。
-    - 训练：RandomResizedCrop + 翻转 + ColorJitter，保持宽高比、减少形变。
+    - 训练：RandomResizedCrop + 翻转 + ColorJitter + RandomRotation + RandomAffine，ISIC 背景变化大。
     - 验证/测试：Resize 短边后 CenterCrop 成 img_size×img_size，无随机性。
     """
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -182,6 +193,8 @@ def get_transforms(img_size, is_train=True):
             transforms.RandomResizedCrop(img_size, scale=(0.8, 1.0), ratio=(0.9, 1.1)),
             transforms.RandomHorizontalFlip(),
             transforms.RandomVerticalFlip(),
+            transforms.RandomRotation(20),
+            transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1)),
             transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
             transforms.ToTensor(),
             normalize,
@@ -327,19 +340,19 @@ def plot_confusion_matrix(y_true, y_pred, num_classes, save_path, class_names=No
         print(f'混淆矩阵 CSV 已保存: {save_csv_path}')
 
 
-# 训练历史字典的键，与 plot_curves / checkpoint 一致
-_HISTORY_KEYS = ('train_loss', 'val_loss', 'train_bal_acc', 'val_bal_acc')
+# 训练历史字典的键，与 plot_curves / checkpoint 一致（含每轮测试集指标）
+_HISTORY_KEYS = ('train_loss', 'val_loss', 'train_bal_acc', 'val_bal_acc', 'test_loss', 'test_bal_acc')
 
 
 def _empty_history():
-    """返回空训练历史（四键，空列表）。"""
+    """返回空训练历史（六键，空列表）。"""
     return {k: [] for k in _HISTORY_KEYS}
 
 
 def _normalize_history(history):
     """
-    规范化 history：保证包含 _HISTORY_KEYS 四个键，值为列表；
-    若长度不一致则截断到最短长度，避免绘图错位。
+    规范化 history：保证包含 _HISTORY_KEYS 各键，值为列表；
+    长度取「有数据的键」的最短长度，避免绘图错位；兼容旧 checkpoint 无 test_* 的情况。
     """
     if not history or not isinstance(history, dict):
         return _empty_history()
@@ -347,7 +360,8 @@ def _normalize_history(history):
     for k in _HISTORY_KEYS:
         v = history.get(k)
         out[k] = list(v) if isinstance(v, (list, np.ndarray)) else []
-    n = min(len(out[k]) for k in _HISTORY_KEYS)
+    lengths = [len(out[k]) for k in _HISTORY_KEYS if len(out[k]) > 0]
+    n = min(lengths) if lengths else 0
     if n == 0:
         return out
     return {k: out[k][:n] for k in _HISTORY_KEYS}
@@ -437,8 +451,8 @@ def _run_final_test_eval(model, test_loader, criterion, device, save_dir, num_cl
 
 def plot_curves(history, save_dir):
     """
-    根据训练历史绘制 Loss 与 Balanced Accuracy 两条曲线，保存到 save_dir。
-    history 需包含 train_loss, val_loss, train_bal_acc, val_bal_acc（列表，按 epoch 顺序）。
+    根据训练历史绘制 Loss 与 Balanced Accuracy 曲线（含测试集），保存到 save_dir。
+    history 需包含 train_loss, val_loss, train_bal_acc, val_bal_acc；若有 test_loss/test_bal_acc 则同图绘制。
     """
     history = _normalize_history(history)
     if not history.get('train_loss'):
@@ -446,25 +460,37 @@ def plot_curves(history, save_dir):
         return
     n = len(history['train_loss'])
     epochs = np.arange(1, n + 1)
-    # 两条曲线：Loss / Balanced Accuracy，结构相同
-    curves = [
-        ('train_loss', 'val_loss', 'Loss', 'Training & Validation Loss', 'loss_curve.png'),
-        ('train_bal_acc', 'val_bal_acc', 'Balanced Accuracy', 'Training & Validation Balanced Accuracy', 'balanced_accuracy_curve.png'),
-    ]
-    for key_train, key_val, ylabel, title, fname in curves:
-        fig, ax = plt.subplots(figsize=(7, 5))
-        ax.plot(epochs, history[key_train], 'b-', label=f'Train {ylabel}', linewidth=2)
-        ax.plot(epochs, history[key_val], 'r-', label=f'Val {ylabel}', linewidth=2)
-        ax.set_xlabel('Epoch', fontsize=12)
-        ax.set_ylabel(ylabel, fontsize=12)
-        ax.set_title(title, fontsize=14)
-        ax.legend(loc='best', fontsize=10)
-        ax.grid(True, alpha=0.3)
-        fig.tight_layout()
-        path = os.path.join(save_dir, fname)
-        fig.savefig(path, dpi=150, bbox_inches='tight')
-        plt.close(fig)
-        print(f'{ylabel} 曲线已保存: {path}')
+    has_test = len(history.get('test_loss') or []) > 0
+    # Loss 曲线：train / val，若有则加 test
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(epochs, history['train_loss'], 'b-', label='Train Loss', linewidth=2)
+    ax.plot(epochs, history['val_loss'], 'r-', label='Val Loss', linewidth=2)
+    if has_test:
+        ax.plot(epochs, history['test_loss'], 'g-', label='Test Loss', linewidth=2)
+    ax.set_xlabel('Epoch', fontsize=12)
+    ax.set_ylabel('Loss', fontsize=12)
+    ax.set_title('Training, Validation & Test Loss', fontsize=14)
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(save_dir, 'loss_curve.png'), dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print('Loss 曲线已保存: ' + os.path.join(save_dir, 'loss_curve.png'))
+    # Balanced Accuracy 曲线：train / val，若有则加 test
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(epochs, history['train_bal_acc'], 'b-', label='Train Balanced Accuracy', linewidth=2)
+    ax.plot(epochs, history['val_bal_acc'], 'r-', label='Val Balanced Accuracy', linewidth=2)
+    if has_test:
+        ax.plot(epochs, history['test_bal_acc'], 'g-', label='Test Balanced Accuracy', linewidth=2)
+    ax.set_xlabel('Epoch', fontsize=12)
+    ax.set_ylabel('Balanced Accuracy', fontsize=12)
+    ax.set_title('Training, Validation & Test Balanced Accuracy', fontsize=14)
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(save_dir, 'balanced_accuracy_curve.png'), dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print('Balanced Accuracy 曲线已保存: ' + os.path.join(save_dir, 'balanced_accuracy_curve.png'))
 
 
 def print_hyperparameters(args, device):
@@ -481,9 +507,10 @@ def print_hyperparameters(args, device):
         ]),
         ('训练', [
             ('训练轮数', args.epochs), ('批大小', args.batch_size), ('学习率', args.lr),
-            ('optimizer', 'AdamW'), ('weight_decay', '1e-2'),
+            ('optimizer', 'AdamW'), ('weight_decay', getattr(args, 'weight_decay', 1e-4)),
             ('scheduler', 'CosineAnnealingLR (T_max=epochs)'),
-            ('criterion', f'FocalLoss(alpha=class_weight, gamma={args.focal_gamma})'),
+            ('criterion', 'FocalLoss(alpha, gamma)' if getattr(args, 'use_focal', False) else f'CrossEntropyLoss(weight, label_smoothing={getattr(args, "label_smoothing", 0.1)})'),
+            ('early_stopping_patience', getattr(args, 'early_stopping_patience', 0)),
         ]),
         ('其他', [
             ('val_ratio', args.val_ratio), ('stratify_seed', args.stratify_seed),
@@ -621,8 +648,19 @@ def main():
         dropout=0.3,
     ).to(device)
 
-    criterion = FocalLoss(alpha=focal_alpha, gamma=args.focal_gamma, reduction='mean')
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
+    # 推荐 CE + class_weight + label_smoothing；Focal+class_weight 易过度强化少数类、泛化变差
+    if getattr(args, 'use_focal', False):
+        criterion = FocalLoss(alpha=focal_alpha, gamma=args.focal_gamma, reduction='mean')
+    else:
+        criterion = nn.CrossEntropyLoss(
+            weight=focal_alpha,
+            label_smoothing=getattr(args, 'label_smoothing', 0.1),
+        )
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=getattr(args, 'weight_decay', 1e-4),
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     log_path = os.path.join(args.save_dir, 'train_log.txt')
@@ -668,6 +706,8 @@ def main():
         return
 
     try:
+        early_patience = getattr(args, 'early_stopping_patience', 0)
+        epochs_without_improvement = 0
         # 训练循环：每轮 train → evaluate → 记录 history → 若 val 更优则存 best，每轮存 last
         for epoch in range(start_epoch, args.epochs + 1):
             print(f'\n========== Epoch {epoch}/{args.epochs} ==========')
@@ -677,14 +717,17 @@ def main():
                 gpu_temp_cooldown=args.gpu_temp_cooldown,
             )
             val_loss, val_bal_acc = evaluate(model, val_loader, criterion, device)
+            # 每轮在测试集上评估一次（仅记录曲线，不参与选 best；best 仍由 val 决定）
+            test_loss, test_bal_acc = evaluate(model, test_loader, criterion, device)
             lr_now = scheduler.get_last_lr()[0]  # 先取 LR 再 step，打印与本期训练一致
             scheduler.step()
 
-            # 控制台与日志文件写入本轮指标
+            # 控制台与日志文件写入本轮指标（含测试集）
             line = (
                 f'Epoch {epoch:3d}  '
-                f'Train Loss: {train_loss:.4f}  Train BalancedAcc: {train_bal_acc:.4f}  '
-                f'Val Loss: {val_loss:.4f}  Val BalancedAcc: {val_bal_acc:.4f}  '
+                f'Train Loss: {train_loss:.4f}  Train BalAcc: {train_bal_acc:.4f}  '
+                f'Val Loss: {val_loss:.4f}  Val BalAcc: {val_bal_acc:.4f}  '
+                f'Test Loss: {test_loss:.4f}  Test BalAcc: {test_bal_acc:.4f}  '
                 f'LR: {lr_now:.2e}\n'
             )
             print(line.strip())
@@ -696,6 +739,8 @@ def main():
             history['val_loss'].append(float(val_loss))
             history['train_bal_acc'].append(float(train_bal_acc))
             history['val_bal_acc'].append(float(val_bal_acc))
+            history['test_loss'].append(float(test_loss))
+            history['test_bal_acc'].append(float(test_bal_acc))
 
             # 每轮保存 last；验证集 Balanced Accuracy 创新高则额外保存 best（结构一致，便于 --resume）
             ckpt_base = {
@@ -708,10 +753,19 @@ def main():
             }
             if val_bal_acc > best_bal_acc:
                 best_bal_acc = val_bal_acc
+                epochs_without_improvement = 0
                 torch.save({**ckpt_base, 'val_balanced_accuracy': float(val_bal_acc)},
                           os.path.join(args.save_dir, 'best_model.pth'))
                 print(f'  -> 保存最佳模型 (BalancedAcc={val_bal_acc:.4f}) -> {os.path.join(args.save_dir, "best_model.pth")}')
+            else:
+                epochs_without_improvement += 1
             torch.save(ckpt_base, os.path.join(args.save_dir, 'last_model.pth'))
+
+            if early_patience > 0 and epochs_without_improvement >= early_patience:
+                print(f'\n[Early Stopping] 验证集 {early_patience} 轮无提升，停止训练。')
+                with open(log_path, 'a', encoding='utf-8') as f:
+                    f.write(f'\n[Early Stopping] Epoch {epoch} 验证集 {early_patience} 轮无提升\n')
+                break
 
         # 正常结束：写最佳指标与结束时间到日志
         with open(log_path, 'a', encoding='utf-8') as f:
