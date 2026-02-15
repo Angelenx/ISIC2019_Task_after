@@ -105,7 +105,41 @@ class FocalLoss(nn.Module):
 
 
 def get_args():
-    """解析命令行参数，返回训练所需配置（Namespace）。"""
+    """
+    解析命令行参数，返回训练所需配置（Namespace）。
+    若指定 --config 或使用 --resume（则默认用 checkpoint 同目录 config.json），先从 config 加载默认值，再以命令行覆盖。
+    """
+    # 先解析 --config 与 --resume，确定要加载的 config 文件
+    pre_parser = argparse.ArgumentParser()
+    pre_parser.add_argument('--config', type=str, default=None, help='（由主解析器定义，此处仅用于先读）')
+    pre_parser.add_argument('--resume', type=str, default='', help='（由主解析器定义，此处仅用于先读）')
+    pre_args, _ = pre_parser.parse_known_args()
+    _config_debug = lambda msg: print(f"[Config] {msg}", flush=True)
+    _config_debug(f"预解析: --config={getattr(pre_args, 'config', None)!r}, --resume={getattr(pre_args, 'resume', None)!r}")
+
+    config_path = None
+    config_source = None
+    if getattr(pre_args, 'config', None) and str(pre_args.config).strip():
+        config_path = os.path.normpath(str(pre_args.config).strip())
+        config_source = "命令行 --config"
+    elif getattr(pre_args, 'resume', None) and str(pre_args.resume).strip():
+        resume_path = os.path.normpath(str(pre_args.resume).strip())
+        if os.path.isfile(resume_path):
+            config_path = os.path.join(os.path.dirname(resume_path), 'config.json')
+            config_source = f"resume 同目录 (--resume={resume_path!r})"
+        else:
+            _config_debug(f"跳过 resume 目录 config: --resume 文件不存在 {resume_path!r}")
+    if config_path is not None:
+        _config_debug(f"目标 config 路径: {config_path!r} (来源: {config_source})")
+
+    config_dict = {}
+    if config_path and os.path.isfile(config_path):
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config_dict = json.load(f)
+        _config_debug(f"已加载 config 文件: 共 {len(config_dict)} 个键")
+    elif config_path:
+        _config_debug(f"未找到 config 文件，将使用脚本默认值: {config_path!r}")
+
     parser = argparse.ArgumentParser(description='ISIC2019 EfficientNet-B3 训练')
     # ---------- 数据路径 ----------
     parser.add_argument('--img_dir', type=str,
@@ -149,6 +183,22 @@ def get_args():
     # ---------- 继续训练 ----------
     parser.add_argument('--resume', type=str, default='',
                         help='从指定 checkpoint 继续训练，如 checkpoints/last_model.pth；留空则从头训练')
+    parser.add_argument('--config', type=str, default=None,
+                        help='指定 config.json 路径；未指定且使用 --resume 时默认使用 checkpoint 同目录下的 config.json；命令行参数可覆盖 config 中的值')
+    # 用 config 中的值作为 parser 默认值，命令行传入的参数会覆盖这些默认值
+    if config_dict:
+        valid_dests = {a.dest for a in parser._actions if getattr(a, 'dest', None) and a.dest != 'help'}
+        defaults_from_config = {k: v for k, v in config_dict.items() if k in valid_dests}
+        skipped = set(config_dict) - set(defaults_from_config)
+        if skipped:
+            _config_debug(f"config 中已忽略的键（不在解析器中）: {sorted(skipped)}")
+        if defaults_from_config:
+            parser.set_defaults(**defaults_from_config)
+            _config_debug(f"已将 config 作为默认值应用到 {len(defaults_from_config)} 个参数: {sorted(defaults_from_config.keys())}")
+        else:
+            _config_debug("config 中无与解析器匹配的键，未应用默认值")
+    else:
+        _config_debug("未加载 config，全部使用脚本默认值；命令行参数直接覆盖脚本默认值")
     args = parser.parse_args()
     # 若指定了 global_seed，则覆盖 seed 与 stratify_seed，保持与 config 兼容（config 会保存 global_seed 及生效后的 seed/stratify_seed）
     if getattr(args, 'global_seed', None) is not None:
@@ -158,6 +208,12 @@ def get_args():
     args.log_interval = max(1, int(args.log_interval))
     args.epochs = max(1, int(args.epochs))
     args.batch_size = max(1, int(args.batch_size))
+    # 打印最终生效的若干关键参数，便于核对 config/命令行 覆盖是否正确
+    if config_dict:
+        _config_debug(
+            f"最终生效（config + 命令行覆盖）: save_dir={args.save_dir!r}, epochs={args.epochs}, "
+            f"batch_size={args.batch_size}, lr={args.lr}, resume={getattr(args, 'resume', '')!r}"
+        )
     return args
 
 
